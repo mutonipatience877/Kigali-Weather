@@ -1,5 +1,7 @@
-# Session 5 — Exam Review Notes
-Compiled from our walkthrough: concepts + the code we built together (Kigali Weather guide + your Study Room Booking System for Part 2). This is a study reference, not a project to hand in — you wrote the Booking/UsageRecord pieces yourself; make sure you can still explain every line below out loud.
+# Session 5 & 6 — Exam Review Notes
+Compiled from our walkthrough: concepts + the code we built together (Kigali Weather guide, Firebase/Firestore guide, and your Study Room Booking System applied across both). This is a study reference, not a project to hand in — you wrote the Booking/UsageRecord/security-rule pieces yourself; make sure you can still explain every line below out loud.
+
+**Session 5** (async/await, REST APIs, `shared_preferences`) is below. **Session 6** (Firebase: Auth, Firestore, Streams, security rules) starts at §9.
 
 ---
 
@@ -266,3 +268,167 @@ if (index != -1) bookings[index] = bookings[index].copyWith(status: BookingStatu
 ```
 
 Both are correct. (A) rebuilds the list; (B) mutates one slot and needs an explicit "not found" guard (`-1`) that (A) doesn't, since `.map` silently no-ops on no match.
+
+---
+---
+
+# Session 6 — Firebase (Auth, Firestore, Streams, Security Rules)
+
+## 9. Future vs Stream
+
+A `Future` is a box: filled once, then done (logging in, saving one document) — pairs with `await` / `FutureBuilder`.
+A `Stream` is a pipe: delivers a value now, and *again* every time something changes (who's logged in, the live list of data) — pairs with `.listen()` / `StreamBuilder`.
+
+Rule of thumb: "do something" → `Future`. "Watch something that can change while I'm looking at it" → `Stream`. Login state is a `Stream` (`authStateChanges()`) even though it feels like a one-time check, because it *can* change while the app is open (sign out, token expiry).
+
+```dart
+Future<void> login(String email, String password) async {
+  await FirebaseAuth.instance.signInWithEmailAndPassword(email: email, password: password);
+}
+
+Stream<User?> whoIsLoggedIn = FirebaseAuth.instance.authStateChanges();
+```
+
+---
+
+## 10. Auth + specific exception types
+
+```dart
+Future<void> signUp(String email, String password) async {
+  try {
+    await FirebaseAuth.instance.createUserWithEmailAndPassword(email: email, password: password);
+  } on FirebaseAuthException catch (e) {
+    setState(() { error = _message(e.code); });
+  }
+}
+
+String _message(String code) {
+  switch (code) {
+    case 'email-already-in-use': return 'An account already exists for that email.';
+    case 'weak-password': return 'Choose a stronger password (6+ characters).';
+    case 'invalid-credential':
+    case 'wrong-password':
+    case 'user-not-found': return 'Email or password is incorrect.';
+    case 'network-request-failed': return 'No internet connection.';
+    default: return 'Something went wrong. Try again.';
+  }
+}
+```
+
+**Why `on FirebaseAuthException catch (e)` instead of a generic `catch (e)`?** It lets you react to specific error codes with specific messages — *and*, just as important, anything that **isn't** a `FirebaseAuthException` (a bug in your own code) is **not** caught here. It propagates instead, so you see it and fix it, rather than it being silently swallowed into a generic "something went wrong."
+
+---
+
+## 11. Saving data: `toMap()` / `fromDoc()`, and why the server's clock
+
+```dart
+class Txn {
+  final String? id;
+  final String description;
+  final double amount;
+  final bool isIn;
+  final DateTime? createdAt;
+
+  Txn({this.id, required this.description, required this.amount, required this.isIn, this.createdAt});
+
+  Map<String, dynamic> toMap() => {
+    'description': description,
+    'amount': amount,
+    'isIn': isIn,
+    'createdAt': FieldValue.serverTimestamp(),
+  };
+
+  factory Txn.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
+    return Txn(
+      id: doc.id,
+      description: data['description'] as String,
+      amount: (data['amount'] as num).toDouble(),
+      isIn: data['isIn'] as bool,
+      createdAt: (data['createdAt'] as Timestamp?)?.toDate(),
+    );
+  }
+}
+
+CollectionReference<Map<String, dynamic>> myTransactions() {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance.collection('users').doc(uid).collection('transactions');
+}
+
+Future<void> addTransaction(Txn txn) async => await myTransactions().add(txn.toMap());
+```
+
+**Why `FieldValue.serverTimestamp()` instead of `DateTime.now()`?** Phones can't be trusted — clocks can be wrong, time zones differ, and a user could spoof their own device clock to make a transaction look older/newer than it is. The server decides, not the device. Same principle as security rules running server-side instead of trusting an `if` in Flutter.
+
+Note: this applies to *audit* timestamps (`createdAt` — "when did this write happen"). A field like a chosen booking date/time is a different kind of fact — the user picks it, so it's stored as a real `DateTime`/`Timestamp.fromDate(...)`, not `serverTimestamp()`.
+
+---
+
+## 12. `StreamBuilder`, four states, and "save facts, compute the rest"
+
+```dart
+StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+  stream: myTransactions().orderBy('createdAt').snapshots(),
+  builder: (context, snapshot) {
+    if (snapshot.connectionState == ConnectionState.waiting) {
+      return Center(child: CircularProgressIndicator());               // loading
+    }
+    if (snapshot.hasError) {
+      return Center(child: Text('Could not load your transactions.'));  // error
+    }
+    final docs = snapshot.data!.docs;
+    if (docs.isEmpty) {
+      return Center(child: Text('No transactions yet. Add one below.')); // empty
+    }
+    final txns = docs.map((d) => Txn.fromDoc(d)).toList();
+    final balance = txns.fold<double>(0, (sum, t) => sum + (t.isIn ? t.amount : -t.amount));
+    return Column(children: [
+      Text('${balance.toStringAsFixed(0)} RWF'),
+      Expanded(child: ListView(children: txns.map((t) =>
+        ListTile(title: Text(t.description), trailing: Text('${t.isIn ? '+' : '-'}${t.amount}'))).toList())),
+    ]);  // data
+  },
+)
+```
+
+`balance` is never written to Firestore — it's recomputed from the full transaction list every time the stream delivers. **Why never save it?** A saved total is a second copy of the truth; if a write ever fails or a transaction gets deleted, a saved balance can silently disagree with the actual transactions. A computed value *can't* disagree — it *is* the transactions.
+
+**Trace a delete, end to end:** delete removes the doc from Firestore → Firestore pushes a new snapshot down the stream → `StreamBuilder` rebuilds automatically (no manual `setState`) → `fold` reruns on the new (shorter) list → the new balance renders. This full chain — "stop manually tracking when to refresh" — is the real upgrade Streams give you over Session 5's `setState`-driven `load()`.
+
+```dart
+Future<void> updateTransaction(Txn txn) async => await myTransactions().doc(txn.id).update(txn.toMap());
+Future<void> deleteTransaction(String id) async => await myTransactions().doc(id).delete();
+```
+
+---
+
+## 13. Security rules — the server says no
+
+The phone can't be trusted: an `if` in Flutter is a sign, not a lock — anyone can skip your app and call Firestore directly. Rules run **on Google's servers**, where no user can bypass them.
+
+**Console options when creating the database:**
+- **Test mode (never use)**: `allow read, write: if true` — anyone, no login required, can read/write everyone's data. Also auto-locks the whole database after 30 days.
+- **Production mode (always choose)**: starts fully locked — nothing is readable/writable until you publish your own rule.
+
+**Simple case — data owned by one user** (`users/{uid}/transactions`):
+```
+match /users/{userId}/{document=**} {
+  allow read, write: if request.auth != null && request.auth.uid == userId;
+}
+```
+Both conditions are required together: `request.auth != null` blocks anonymous strangers; `request.auth.uid == userId` blocks *other logged-in users* from reading each other's data by editing the UID in a request. Either one alone leaves a real hole.
+
+**Harder case — data shared between two roles** (e.g. a booking visible to both the student who made it and the supervisor assigned to it): don't nest under one owner's path — use a top-level collection with both ids as fields, and check the relationship instead of the path:
+
+```
+match /bookings/{bookingId} {
+  allow read: if request.auth != null &&
+    (request.auth.uid == resource.data.studentId ||
+     request.auth.uid == resource.data.supervisorId);
+
+  allow create: if request.auth != null &&
+    request.auth.uid == request.resource.data.studentId;
+}
+```
+
+**The single most common Firestore rules mistake:** `resource.data` is the *existing* document — use it for `read`/`update`/`delete` checks. `request.resource.data` is the *incoming* data being written — use it for `create`/`update` checks, since on `create` there's no existing document yet for `resource` to refer to. Mixing these two up is the classic bug.
